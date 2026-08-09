@@ -1,4 +1,5 @@
-name: Android signed release
+
+name: Android Signed Release
 
 on:
   push:
@@ -9,8 +10,7 @@ on:
 
   workflow_dispatch:
 
-# Prevent multiple release jobs from choosing the same version
-# if several pushes happen at nearly the same time
+# Prevent two builds from trying to create the same release version.
 concurrency:
   group: android-signed-release
   cancel-in-progress: false
@@ -19,6 +19,7 @@ jobs:
   build-signed-release:
     runs-on: ubuntu-latest
 
+    # Required so GITHUB_TOKEN can create tags/releases.
     permissions:
       contents: write
 
@@ -30,18 +31,36 @@ jobs:
       ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
 
     steps:
+      # ---------------------------------------------------------
+      # Checkout repository
+      # ---------------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v6
 
+      # ---------------------------------------------------------
+      # Java
+      # ---------------------------------------------------------
       - name: Set up JDK 21
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
 
-      - name: Set up Gradle
+      # ---------------------------------------------------------
+      # Gradle
+      #
+      # IMPORTANT:
+      # Gradle 9.6 currently breaks the AGP version used by
+      # this project, so Gradle is explicitly pinned to 9.5.0.
+      # ---------------------------------------------------------
+      - name: Set up Gradle 9.5
         uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '9.5.0'
 
+      # ---------------------------------------------------------
+      # Android SDK
+      # ---------------------------------------------------------
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
@@ -52,36 +71,116 @@ jobs:
             "build-tools;35.0.0" \
             "platform-tools"
 
+      # ---------------------------------------------------------
+      # Verify signing secrets
+      # ---------------------------------------------------------
       - name: Verify signing secrets
+        shell: bash
         run: |
-          test -n "$ANDROID_SIGNING_KEYSTORE_BASE64"
-          test -n "$ANDROID_KEYSTORE_PASSWORD"
-          test -n "$ANDROID_KEY_ALIAS"
-          test -n "$ANDROID_KEY_PASSWORD"
+          if [ -z "$ANDROID_SIGNING_KEYSTORE_BASE64" ]; then
+            echo "::error::ANDROID_SIGNING_KEYSTORE_BASE64 is missing"
+            exit 1
+          fi
 
+          if [ -z "$ANDROID_KEYSTORE_PASSWORD" ]; then
+            echo "::error::ANDROID_KEYSTORE_PASSWORD is missing"
+            exit 1
+          fi
+
+          if [ -z "$ANDROID_KEY_ALIAS" ]; then
+            echo "::error::ANDROID_KEY_ALIAS is missing"
+            exit 1
+          fi
+
+          if [ -z "$ANDROID_KEY_PASSWORD" ]; then
+            echo "::error::ANDROID_KEY_PASSWORD is missing"
+            exit 1
+          fi
+
+          echo "All Android signing secrets are present."
+
+      # ---------------------------------------------------------
+      # Decode keystore
+      # ---------------------------------------------------------
       - name: Decode release keystore
+        shell: bash
         run: |
+          mkdir -p "$(dirname "$ANDROID_KEYSTORE_PATH")"
+
           printf '%s' "$ANDROID_SIGNING_KEYSTORE_BASE64" \
             | base64 --decode \
             > "$ANDROID_KEYSTORE_PATH"
 
-          test -s "$ANDROID_KEYSTORE_PATH"
+          if [ ! -s "$ANDROID_KEYSTORE_PATH" ]; then
+            echo "::error::Decoded keystore is empty."
+            exit 1
+          fi
 
+          echo "Keystore successfully decoded."
+
+      # ---------------------------------------------------------
+      # Show build environment
+      # ---------------------------------------------------------
+      - name: Show build versions
+        run: |
+          java -version
+          gradle --version
+          sdkmanager --version
+
+      # ---------------------------------------------------------
+      # Tests + lint
+      # ---------------------------------------------------------
       - name: Run tests and lint
         run: |
           gradle --no-daemon clean test lint
 
+      # ---------------------------------------------------------
+      # Build signed release APK
+      # ---------------------------------------------------------
       - name: Build signed release APK
         run: |
           gradle --no-daemon assembleRelease
 
       # ---------------------------------------------------------
-      # Determine next GitHub Release version
+      # Verify APK exists
+      # ---------------------------------------------------------
+      - name: Verify release APK
+        shell: bash
+        run: |
+          echo "Searching for release APK..."
+
+          find app/build/outputs/apk/release \
+            -maxdepth 1 \
+            -type f \
+            -name "*.apk" \
+            -print
+
+          APK_COUNT="$(
+            find app/build/outputs/apk/release \
+              -maxdepth 1 \
+              -type f \
+              -name "*.apk" \
+              | wc -l
+          )"
+
+          if [ "$APK_COUNT" -eq 0 ]; then
+            echo "::error::No release APK was generated."
+            exit 1
+          fi
+
+          echo "Found $APK_COUNT APK file(s)."
+
+      # ---------------------------------------------------------
+      # Determine next GitHub Release tag
       #
-      # No release  -> v1.0.0
-      # v1.0.0      -> v1.0.1
-      # v1.0.9      -> v1.0.10
-      # v2.5.12     -> v2.5.13
+      # Examples:
+      #
+      # No previous release -> v1.0.0
+      # v1.0.0             -> v1.0.1
+      # v1.0.1             -> v1.0.2
+      # v1.0.9             -> v1.0.10
+      # v1.2.99            -> v1.2.100
+      # v2.5.12            -> v2.5.13
       # ---------------------------------------------------------
       - name: Determine next release version
         id: version
@@ -89,7 +188,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          echo "Checking latest GitHub release..."
+          echo "Checking latest GitHub Release..."
 
           LATEST_TAG="$(
             gh api \
@@ -98,20 +197,18 @@ jobs:
               2>/dev/null || true
           )"
 
-          echo "Latest release tag: ${LATEST_TAG:-none}"
-
           if [ -z "$LATEST_TAG" ]; then
-
+            echo "No previous GitHub Release found."
             NEXT_TAG="v1.0.0"
-
           else
+            echo "Latest GitHub Release: $LATEST_TAG"
 
-            # Remove leading "v"
+            # Remove leading "v" if present.
             VERSION="${LATEST_TAG#v}"
 
-            # Validate semantic version format
+            # Require MAJOR.MINOR.PATCH format.
             if [[ ! "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-              echo "::error::Latest release tag '$LATEST_TAG' is not in vMAJOR.MINOR.PATCH format."
+              echo "::error::Latest release tag '$LATEST_TAG' does not match vMAJOR.MINOR.PATCH format."
               exit 1
             fi
 
@@ -119,17 +216,19 @@ jobs:
             MINOR="${BASH_REMATCH[2]}"
             PATCH="${BASH_REMATCH[3]}"
 
+            # Increment patch number.
             PATCH=$((PATCH + 1))
 
             NEXT_TAG="v${MAJOR}.${MINOR}.${PATCH}"
-
           fi
 
-          echo "Next release tag: $NEXT_TAG"
+          echo "Next GitHub Release: $NEXT_TAG"
 
           echo "tag=$NEXT_TAG" >> "$GITHUB_OUTPUT"
 
-      # Give the APK a nicer release filename.
+      # ---------------------------------------------------------
+      # Rename/copy APK to cleaner release filename
+      # ---------------------------------------------------------
       - name: Prepare release APK
         id: apk
         shell: bash
@@ -151,22 +250,54 @@ jobs:
 
           RELEASE_APK="screencaster-${TAG}.apk"
 
+          echo "Source APK:"
+          echo "$APK_FILE"
+
+          echo "Creating:"
+          echo "$RELEASE_APK"
+
           cp "$APK_FILE" "$RELEASE_APK"
 
-          echo "Original APK: $APK_FILE"
-          echo "Release APK:  $RELEASE_APK"
+          if [ ! -s "$RELEASE_APK" ]; then
+            echo "::error::Failed to prepare release APK."
+            exit 1
+          fi
 
           echo "path=$RELEASE_APK" >> "$GITHUB_OUTPUT"
+          echo "name=$RELEASE_APK" >> "$GITHUB_OUTPUT"
 
-      # Keep the APK available from the Actions run too.
-      - name: Upload signed release APK artifact
+      # ---------------------------------------------------------
+      # Show release information
+      # ---------------------------------------------------------
+      - name: Show release information
+        run: |
+          echo "Release tag: ${{ steps.version.outputs.tag }}"
+          echo "APK: ${{ steps.apk.outputs.path }}"
+          ls -lh "${{ steps.apk.outputs.path }}"
+
+      # ---------------------------------------------------------
+      # Upload APK to GitHub Actions artifacts
+      #
+      # This is separate from GitHub Releases and allows
+      # downloading directly from the workflow run.
+      # ---------------------------------------------------------
+      - name: Upload signed APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: screencaster-${{ steps.version.outputs.tag }}
           path: ${{ steps.apk.outputs.path }}
           if-no-files-found: error
+          retention-days: 30
 
-      # Create the GitHub tag + GitHub Release + attach APK.
+      # ---------------------------------------------------------
+      # Create GitHub Release
+      #
+      # Creates:
+      #   - Git tag
+      #   - GitHub Release
+      #   - Automatic release notes
+      #   - APK attachment
+      # ---------------------------------------------------------
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -183,4 +314,21 @@ jobs:
             --title "$RELEASE_TAG" \
             --generate-notes
 
-          echo "Successfully released $RELEASE_TAG"
+          echo ""
+          echo "========================================"
+          echo "GitHub Release created successfully"
+          echo "========================================"
+          echo "Version: $RELEASE_TAG"
+          echo "APK:     $APK_PATH"
+
+      # ---------------------------------------------------------
+      # Cleanup sensitive keystore
+      # ---------------------------------------------------------
+      - name: Remove decoded keystore
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$ANDROID_KEYSTORE_PATH" ]; then
+            rm -f "$ANDROID_KEYSTORE_PATH"
+            echo "Temporary decoded keystore removed."
+        
