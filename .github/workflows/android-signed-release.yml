@@ -1,16 +1,27 @@
+```yaml
 name: Android signed release
 
 on:
   push:
-    branches: [ main, master, work ]
+    branches:
+      - main
+      - master
+      - work
+
   workflow_dispatch:
+
+# Prevent multiple release jobs from choosing the same version
+# if several pushes happen at nearly the same time.
+concurrency:
+  group: android-signed-release
+  cancel-in-progress: false
 
 jobs:
   build-signed-release:
     runs-on: ubuntu-latest
 
     permissions:
-      contents: read
+      contents: write
 
     env:
       ANDROID_KEYSTORE_PATH: ${{ github.workspace }}/app/release-upload.jks
@@ -36,7 +47,11 @@ jobs:
         uses: android-actions/setup-android@v4
 
       - name: Install Android SDK packages
-        run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+        run: |
+          sdkmanager \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "platform-tools"
 
       - name: Verify signing secrets
         run: |
@@ -47,18 +62,127 @@ jobs:
 
       - name: Decode release keystore
         run: |
-          printf '%s' "$ANDROID_SIGNING_KEYSTORE_BASE64" | base64 --decode > "$ANDROID_KEYSTORE_PATH"
+          printf '%s' "$ANDROID_SIGNING_KEYSTORE_BASE64" \
+            | base64 --decode \
+            > "$ANDROID_KEYSTORE_PATH"
+
           test -s "$ANDROID_KEYSTORE_PATH"
 
       - name: Run tests and lint
-        run: gradle --no-daemon clean test lint
+        run: |
+          gradle --no-daemon clean test lint
 
       - name: Build signed release APK
-        run: gradle --no-daemon assembleRelease
+        run: |
+          gradle --no-daemon assembleRelease
 
-      - name: Upload signed release APK
+      # ---------------------------------------------------------
+      # Determine next GitHub Release version
+      #
+      # No release  -> v1.0.0
+      # v1.0.0      -> v1.0.1
+      # v1.0.9      -> v1.0.10
+      # v2.5.12     -> v2.5.13
+      # ---------------------------------------------------------
+      - name: Determine next release version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          echo "Checking latest GitHub release..."
+
+          LATEST_TAG="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/releases/latest" \
+              --jq '.tag_name' \
+              2>/dev/null || true
+          )"
+
+          echo "Latest release tag: ${LATEST_TAG:-none}"
+
+          if [ -z "$LATEST_TAG" ]; then
+
+            NEXT_TAG="v1.0.0"
+
+          else
+
+            # Remove leading "v"
+            VERSION="${LATEST_TAG#v}"
+
+            # Validate semantic version format
+            if [[ ! "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              echo "::error::Latest release tag '$LATEST_TAG' is not in vMAJOR.MINOR.PATCH format."
+              exit 1
+            fi
+
+            MAJOR="${BASH_REMATCH[1]}"
+            MINOR="${BASH_REMATCH[2]}"
+            PATCH="${BASH_REMATCH[3]}"
+
+            PATCH=$((PATCH + 1))
+
+            NEXT_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+
+          fi
+
+          echo "Next release tag: $NEXT_TAG"
+
+          echo "tag=$NEXT_TAG" >> "$GITHUB_OUTPUT"
+
+      # Give the APK a nicer release filename.
+      - name: Prepare release APK
+        id: apk
+        shell: bash
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+
+          APK_FILE="$(
+            find app/build/outputs/apk/release \
+              -maxdepth 1 \
+              -type f \
+              -name "*.apk" \
+              | head -n 1
+          )"
+
+          if [ -z "$APK_FILE" ]; then
+            echo "::error::No release APK was found."
+            exit 1
+          fi
+
+          RELEASE_APK="screencaster-${TAG}.apk"
+
+          cp "$APK_FILE" "$RELEASE_APK"
+
+          echo "Original APK: $APK_FILE"
+          echo "Release APK:  $RELEASE_APK"
+
+          echo "path=$RELEASE_APK" >> "$GITHUB_OUTPUT"
+
+      # Keep the APK available from the Actions run too.
+      - name: Upload signed release APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: screencaster-signed-release-apk
-          path: app/build/outputs/apk/release/*.apk
+          name: screencaster-${{ steps.version.outputs.tag }}
+          path: ${{ steps.apk.outputs.path }}
           if-no-files-found: error
+
+      # Create the GitHub tag + GitHub Release + attach APK.
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          APK_PATH: ${{ steps.apk.outputs.path }}
+        shell: bash
+        run: |
+          echo "Creating GitHub Release: $RELEASE_TAG"
+
+          gh release create "$RELEASE_TAG" \
+            "$APK_PATH" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_TAG" \
+            --generate-notes
+
+          echo "Successfully released $RELEASE_TAG"
+```
