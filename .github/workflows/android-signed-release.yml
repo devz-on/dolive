@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
 
 # Prevent multiple release jobs from choosing the same version
-# if several pushes happen at nearly the same time.
+# if several pushes happen at nearly the same time
 concurrency:
   group: android-signed-release
   cancel-in-progress: false
