@@ -1,4 +1,3 @@
-```yaml
 name: Android signed release
 
 on:
@@ -185,4 +184,3 @@ jobs:
             --generate-notes
 
           echo "Successfully released $RELEASE_TAG"
-```
